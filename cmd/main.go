@@ -196,12 +196,32 @@ func initDB(config *Config) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
+
+	// Log connection details for debugging
+	var currentDB, searchPath string
+	_ = db.QueryRow("SELECT current_database()").Scan(&currentDB)
+	_ = db.QueryRow("SHOW search_path").Scan(&searchPath)
+	log.Printf("Connected to database: %s, search_path: %s", currentDB, searchPath)
+
 	// Initialize database schema
-	for i, stmt := range getInitStatements() {
+	stmts := getInitStatements()
+	log.Printf("Executing %d init statements...", len(stmts))
+	for i, stmt := range stmts {
+		preview := stmt
+		if len(preview) > 80 {
+			preview = preview[:80] + "..."
+		}
 		if _, err := db.Exec(stmt); err != nil {
-			log.Printf("Failed to execute init statement %d: %v. Continuing...", i+1, err)
+			log.Printf("Init statement %d/%d FAILED: %v | %s", i+1, len(stmts), err, preview)
+		} else {
+			log.Printf("Init statement %d/%d OK | %s", i+1, len(stmts), preview)
 		}
 	}
+
+	// Verify tables were created
+	var tableCount int
+	_ = db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('categories', 'products', 'reviews')").Scan(&tableCount)
+	log.Printf("Verification: found %d/3 expected tables in public schema", tableCount)
 
 	log.Println("Database connection established")
 	return db, nil
@@ -226,11 +246,24 @@ func initRedis(config *Config) *redis.Client {
 		}
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:      os.Getenv("REDIS_URL"),
-		DB:        0,
-		TLSConfig: tlsCfg,
-	})
+	redisURL := os.Getenv("REDIS_URL")
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Printf("Warning: could not parse REDIS_URL: %v. Falling back to defaults.", err)
+		opts = &redis.Options{
+			Addr: "localhost:6379",
+			DB:   0,
+		}
+	}
+
+	// If we have a custom CA cert, merge it into the TLS config from ParseURL
+	if tlsCfg != nil && opts.TLSConfig != nil {
+		opts.TLSConfig.RootCAs = tlsCfg.RootCAs
+	} else if tlsCfg != nil {
+		opts.TLSConfig = tlsCfg
+	}
+
+	rdb := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
